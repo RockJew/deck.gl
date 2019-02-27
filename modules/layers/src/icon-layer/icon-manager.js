@@ -189,11 +189,6 @@ export default class IconManager {
   }
 
   getTexture() {
-    // if (this._autoPacking) {
-    //
-    // }
-    //
-    // return this._texture;
     return this._autoPacking ? cached.get(this.gl).texture : this._texture;
   }
 
