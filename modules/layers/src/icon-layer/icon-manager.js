@@ -1,7 +1,9 @@
 /* global document */
 import GL from '@luma.gl/constants';
-import {Texture2D} from 'luma.gl';
+import {Texture2D, copyToImage} from 'luma.gl';
 import {loadImage} from '@loaders.gl/core';
+// TODO LRUCache will be moved to @luma.gl/text module in v7.0
+import LRUCache from '../text-layer/lru-cache';
 
 const MAX_CANVAS_WIDTH = 1024;
 const DEFAULT_BUFFER = 4;
@@ -11,6 +13,19 @@ const DEFAULT_TEXTURE_MIN_FILTER = GL.LINEAR_MIPMAP_LINEAR;
 const DEFAULT_TEXTURE_MAG_FILTER = GL.LINEAR;
 
 const noop = () => {};
+
+/**
+ * {
+ *   [gl]: {
+ *     texture, // Texture2D instance containing the icons
+ *     mapping, // Object, {[id]: {width, height, }}
+ *     xOffset, // right position of last icon
+ *     yOffset, // top position of last icon
+ *     canvasHeight // canvas height
+ *   }
+ * }
+ */
+const cached = new LRUCache(3);
 
 function nextPowOfTwo(number) {
   return Math.pow(2, Math.ceil(Math.log2(number)));
@@ -34,12 +49,17 @@ function resizeImage(ctx, imageData, width, height) {
   return ctx.canvas;
 }
 
+function getIconId(icon) {
+  return icon && (icon.id || icon.url);
+}
+
 // traverse icons in a row of icon atlas
 // extend each icon with left-top coordinates
 function buildRowMapping(mapping, columns, yOffset) {
   for (let i = 0; i < columns.length; i++) {
     const {icon, xOffset} = columns[i];
-    mapping[icon.url] = Object.assign({}, icon, {
+    const id = getIconId(icon);
+    mapping[id] = Object.assign({}, icon, {
       x: xOffset,
       y: yOffset
     });
@@ -50,20 +70,24 @@ function buildRowMapping(mapping, columns, yOffset) {
  * Generate coordinate mapping to retrieve icon left-top position from an icon atlas
  * @param icons {Array<Object>} list of icons, each icon requires url, width, height
  * @param buffer {Number} add buffer to the right and bottom side of the image
- * @param maxCanvasHeight {Number}
+ * @param xOffset {Number} right position of last icon in old mapping
+ * @param yOffset {Number} top position in last icon in old mapping
+ * @param maxCanvasWidth {Number} max width of canvas
+ * @param mapping {object} old mapping
  * @returns {{mapping: {'/icon/1': {url, width, height, ...}},, canvasHeight: {Number}}}
  */
-export function buildMapping({icons, buffer, maxCanvasWidth}) {
-  // x position till current column
-  let xOffset = 0;
-  // y position till current row
-  let yOffset = 0;
+export function buildMapping({
+  icons,
+  buffer,
+  mapping = {},
+  xOffset = 0,
+  yOffset = 0,
+  maxCanvasWidth
+}) {
   // height of current row
   let rowHeight = 0;
 
   let columns = [];
-  const mapping = {};
-
   // Strategy to layout all the icons into a texture:
   // traverse the icons sequentially, layout the icons from left to right, top to bottom
   // when the sum of the icons width is equal or larger than maxCanvasWidth,
@@ -73,27 +97,25 @@ export function buildMapping({icons, buffer, maxCanvasWidth}) {
   // mapping coordinates of each icon is its left-top position in the texture
   for (let i = 0; i < icons.length; i++) {
     const icon = icons[i];
-    if (!mapping[icon.url]) {
-      const {height, width} = icon;
+    const {height, width} = icon;
 
-      // fill one row
-      if (xOffset + width + buffer > maxCanvasWidth) {
-        buildRowMapping(mapping, columns, yOffset);
+    // fill one row
+    if (xOffset + width + buffer > maxCanvasWidth) {
+      buildRowMapping(mapping, columns, yOffset);
 
-        xOffset = 0;
-        yOffset = rowHeight + yOffset + buffer;
-        rowHeight = 0;
-        columns = [];
-      }
-
-      columns.push({
-        icon,
-        xOffset
-      });
-
-      xOffset = xOffset + width + buffer;
-      rowHeight = Math.max(rowHeight, height);
+      xOffset = 0;
+      yOffset = rowHeight + yOffset + buffer;
+      rowHeight = 0;
+      columns = [];
     }
+
+    columns.push({
+      icon,
+      xOffset
+    });
+
+    xOffset = xOffset + width + buffer;
+    rowHeight = Math.max(rowHeight, height);
   }
 
   if (columns.length > 0) {
@@ -104,12 +126,16 @@ export function buildMapping({icons, buffer, maxCanvasWidth}) {
 
   return {
     mapping,
+    xOffset,
+    yOffset,
+    canvasWidth: maxCanvasWidth,
     canvasHeight
   };
 }
 
-// extract unique icons from data
-function getIcons(data, getIcon) {
+// extract icons from data
+// return icons should be unique, not cached, cached but url changed
+function getDiffIcons(data, getIcon, cachedIcons) {
   if (!data || !getIcon) {
     return null;
   }
@@ -117,6 +143,8 @@ function getIcons(data, getIcon) {
   const icons = {};
   for (const point of data) {
     const icon = getIcon(point);
+    const id = getIconId(icon);
+
     if (!icon) {
       throw new Error('Icon is missing.');
     }
@@ -125,10 +153,11 @@ function getIcons(data, getIcon) {
       throw new Error('Icon url is missing.');
     }
 
-    if (!icons[icon.url]) {
-      icons[icon.url] = icon;
+    if (!icons[id] || !cachedIcons[id] || !icon.url !== cachedIcons[id].url) {
+      icons[id] = icon;
     }
   }
+
   return icons;
 }
 
@@ -143,21 +172,41 @@ export default class IconManager {
     this.onUpdate = onUpdate;
 
     this._getIcon = null;
-    this._mapping = {};
+
+    cached.set(gl, {
+      mapping: {},
+      xOffset: 0,
+      yOffset: 0,
+      canvasWidth: 0,
+      canvasHeight: 0
+    });
+
     this._texture = null;
+    this._mapping = null;
     this._autoPacking = false;
 
     this._canvas = null;
   }
 
   getTexture() {
-    return this._texture;
+    // if (this._autoPacking) {
+    //
+    // }
+    //
+    // return this._texture;
+    return this._autoPacking ? cached.get(this.gl).texture : this._texture;
   }
 
   getIconMapping(dataPoint) {
     const icon = this._getIcon(dataPoint);
-    const name = this._autoPacking ? icon.url : icon;
-    return this._mapping[name] || {};
+
+    if (this._autoPacking) {
+      const id = getIconId(icon);
+      const mapping = cached.get(this.gl).mapping;
+      return mapping[id] || {};
+    }
+
+    return this._mapping[icon] || {};
   }
 
   setProps({autoPacking, iconAtlas, iconMapping, data, getIcon}) {
@@ -212,42 +261,85 @@ export default class IconManager {
   }
 
   _updateAutoPacking({data, buffer, maxCanvasWidth}) {
-    const icons = Object.values(getIcons(data, this._getIcon) || {});
+    const cachedData = cached.get(this.gl) || {};
+    const icons = Object.values(getDiffIcons(data, this._getIcon, cachedData.mapping) || {});
+
     if (icons.length > 0) {
       // generate icon mapping
-      const {mapping, canvasHeight} = buildMapping({
+      const {mapping, xOffset, yOffset, canvasHeight} = buildMapping({
         icons,
         buffer,
-        maxCanvasWidth
+        maxCanvasWidth,
+        mapping: cachedData.mapping,
+        xOffset: cachedData.xOffset,
+        yOffset: cachedData.yOffset
       });
 
-      this._mapping = mapping;
-
       // create new texture
-      this._texture = new Texture2D(this.gl, {
-        width: maxCanvasWidth,
-        height: canvasHeight
+      let texture = cachedData.texture;
+      if (!texture) {
+        texture = new Texture2D(this.gl, {
+          width: maxCanvasWidth,
+          height: canvasHeight
+        });
+      }
+
+      if (texture.height !== canvasHeight) {
+        this._resizeTexture(texture, texture.width, canvasHeight);
+      }
+
+      cached.set(this.gl, {
+        mapping,
+        texture,
+        xOffset,
+        yOffset,
+        canvasHeight
       });
 
       this.onUpdate();
 
       // load images
-      this._loadImages(icons);
+      this._loadIcons(icons, texture);
     }
   }
 
-  _loadImages(icons) {
+  // resize texture without losing original data
+  _resizeTexture(texture, width, height) {
+    const oldWidth = texture.width;
+    const oldHeight = texture.height;
+    const oldPixels = copyToImage(texture);
+
+    texture.resize({width, height});
+
+    texture.setSubImageData({
+      data: oldPixels,
+      x: 0,
+      y: height - oldHeight,
+      width: oldWidth,
+      height: oldHeight,
+      parameters: {
+        [GL.TEXTURE_MIN_FILTER]: DEFAULT_TEXTURE_MIN_FILTER,
+        [GL.TEXTURE_MAG_FILTER]: DEFAULT_TEXTURE_MAG_FILTER,
+        [GL.UNPACK_FLIP_Y_WEBGL]: true
+      }
+    });
+    texture.generateMipmap();
+
+    return texture;
+  }
+
+  _loadIcons(icons, texture) {
     const ctx = this._canvas.getContext('2d');
-    const canvasHeight = this._texture.height;
+    const canvasHeight = texture.height;
 
     for (const icon of icons) {
       loadImage(icon.url).then(imageData => {
-        const iconMapping = this._mapping[icon.url];
-        const {x, y, width, height} = iconMapping;
+        const id = getIconId(icon);
+        const {x, y, width, height} = cached.get(this.gl).mapping[id];
 
         const data = resizeImage(ctx, imageData, width, height);
 
-        this._texture.setSubImageData({
+        texture.setSubImageData({
           data,
           x,
           y: canvasHeight - y - height, // flip Y as texture stored as reversed Y
@@ -261,7 +353,7 @@ export default class IconManager {
         });
 
         // Call to regenerate mipmaps after modifying texture(s)
-        this._texture.generateMipmap();
+        texture.generateMipmap();
 
         this.onUpdate();
       });
